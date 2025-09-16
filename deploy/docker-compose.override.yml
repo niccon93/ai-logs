@@ -1,0 +1,8 @@
+services:
+  api:
+    volumes:
+      - ../backend:/app/backend:rw
+    environment:
+      # Alembic will prefer env var if set; adjust if you keep it in alembic.ini
+      - DATABASE_URL=postgresql+psycopg://ailog:ailog@db:5432/ailog
+    # Keep entrypoint/working_dir as in your base compose; we only bind backend.

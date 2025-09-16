@@ -1,0 +1,27 @@
+# deploy/Dockerfile.api
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# системные тулзы для сборки python-пакетов
+RUN apt-get update  \
+ && apt-get install -y --no-install-recommends build-essential gcc git postgresql-client \
+ && rm -rf /var/lib/apt/lists/*
+
+# кладём обе requirements, чтобы могли ставить базовые + доп. ML
+COPY backend/requirements.base.txt /app/backend/requirements.base.txt
+COPY backend/requirements.ml.txt   /app/backend/requirements.ml.txt
+
+# сначала ставим базовые зависимости (включая celery)
+RUN pip install --no-cache-dir -r /app/backend/requirements.base.txt
+
+# по умолчанию без ML-дополнений; для worker_ml в docker-compose передаём REQS_FILE=backend/requirements.ml.txt
+ARG REQS_FILE=backend/requirements.base.txt
+RUN if [ "/app/${REQS_FILE}" != "/app/backend/requirements.base.txt" ]; then \
+      pip install --no-cache-dir -r "/app/${REQS_FILE}"; \
+    fi
+
+# основной код
+COPY backend /app/backend
+WORKDIR /app/backend
+ENV PYTHONPATH=/app/backend

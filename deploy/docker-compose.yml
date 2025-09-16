@@ -1,0 +1,188 @@
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ailog
+      POSTGRES_PASSWORD: ailog
+      POSTGRES_DB: ailog
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [appnet]
+
+  mq:
+    image: rabbitmq:3-management
+    restart: unless-stopped
+    ports: ["15672:15672","5672:5672"]
+    networks: [appnet]
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    ports: ["6379:6379"]
+    command: ["redis-server","--appendonly","yes"]
+    networks: [appnet]
+
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+      args:
+        REQS_FILE: backend/requirements.base.txt
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      FERNET_KEYS: ${FERNET_KEYS}
+      JWT_SECRET: ${JWT_SECRET}
+      ADMIN_USER: ${ADMIN_USER}
+      ADMIN_PASS: ${ADMIN_PASS}
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
+      REDIS_URL: ${REDIS_URL}
+      CORS_ORIGINS: ${CORS_ORIGINS}
+      S3_ENDPOINT: ${S3_ENDPOINT}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      S3_BUCKET: ${S3_BUCKET}
+      S3_REGION: ${S3_REGION}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET}
+      OIDC_DISCOVERY_URL: ${OIDC_DISCOVERY_URL}
+      OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI}
+      FRONTEND_URL: ${FRONTEND_URL}
+      RATE_LIMIT_DEFAULT: ${RATE_LIMIT_DEFAULT}
+    depends_on:
+      db:
+        condition: service_healthy
+      mq:
+        condition: service_started
+      redis:
+        condition: service_started
+    command: >
+      sh -c "
+      echo '>> wait DNS for db' &&
+      until getent hosts db; do sleep 1; done &&
+      echo '>> wait Postgres readiness' &&
+      until pg_isready -h db -U ailog; do sleep 1; done &&
+      echo '>> run alembic' &&
+      alembic -c alembic.ini upgrade head &&
+      echo '>> init admin' &&
+      python -m scripts.init_admin &&
+      echo '>> start uvicorn' &&
+      uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    ports: ["8000:8000"]
+    networks: [appnet]
+
+  worker_parse:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+      args:
+        REQS_FILE: backend/requirements.base.txt
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      FERNET_KEYS: ${FERNET_KEYS}
+      REDIS_URL: ${REDIS_URL}
+      S3_ENDPOINT: ${S3_ENDPOINT}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      S3_BUCKET: ${S3_BUCKET}
+      S3_REGION: ${S3_REGION}
+    depends_on:
+      api:
+        condition: service_started
+      mq:
+        condition: service_started
+      redis:
+        condition: service_started
+    command: >
+      sh -c "
+      until getent hosts db; do sleep 1; done &&
+      celery -A app.workers.celery_app worker -Q parse -l info"
+    networks: [appnet]
+
+  worker_ml:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+      args:
+        REQS_FILE: backend/requirements.ml.txt
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      FERNET_KEYS: ${FERNET_KEYS}
+      REDIS_URL: ${REDIS_URL}
+    depends_on:
+      api:
+        condition: service_started
+      mq:
+        condition: service_started
+      redis:
+        condition: service_started
+    command: >
+      sh -c "
+      until getent hosts db; do sleep 1; done &&
+      celery -A app.workers.celery_app worker -Q ml -l info"
+    networks: [appnet]
+
+  beat:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+      args:
+        REQS_FILE: backend/requirements.base.txt
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      FERNET_KEYS: ${FERNET_KEYS}
+      REDIS_URL: ${REDIS_URL}
+    depends_on:
+      api:
+        condition: service_started
+      mq:
+        condition: service_started
+      redis:
+        condition: service_started
+    command: >
+      sh -c "
+      until getent hosts db; do sleep 1; done &&
+      celery -A app.workers.celery_app beat -l info"
+    networks: [appnet]
+
+  flower:
+    image: mher/flower:2.0.0
+    restart: unless-stopped
+    environment:
+      - CELERY_BROKER_URL=${REDIS_URL}
+      - FLOWER_PORT=5555
+    ports: ["5555:5555"]
+    networks: [appnet]
+
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.frontend
+      args:
+        API_URL: ${API_URL}
+    restart: unless-stopped
+    environment:
+      - API_URL=${API_URL}
+    ports: ["8080:80"]
+    depends_on:
+      api:
+        condition: service_started
+    networks:
+      appnet:
+        aliases: [api]   # чтобы upstream api в nginx.conf точно резолвился
+
+volumes:
+  dbdata: {}
+
+networks:
+  appnet:
+    driver: bridge
